@@ -1,8 +1,9 @@
 using Seng2250A3.Services;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddScoped<IMailjetService, MailjetService>();
-
+builder.Services.AddSingleton<IMailjetService, MailjetService>();
+builder.Services.AddSingleton<IUserService, UserService>();
+builder.Services.AddHostedService<StartupInitializationService>();
 builder.Services.AddControllers();
 
 // Add services to the container.
@@ -31,8 +32,13 @@ if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
+    
 }
-
+var configuration = new ConfigurationBuilder()
+    .AddJsonFile("appsettings.json")
+    .Build();
+var mailjetService = new MailjetService(configuration);
+await mailjetService.SendVerificationEmailAsync("batesysgaming@gmail.com", "123456");
 app.UseHttpsRedirection();
 
 // Allow HTTP requests

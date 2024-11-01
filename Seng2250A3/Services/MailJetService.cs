@@ -1,13 +1,13 @@
 using Mailjet.Client;
 using Mailjet.Client.Resources;
-using Newtonsoft.Json.Linq;
-using Microsoft.Extensions.Configuration;
+using Mailjet.Client.TransactionalEmails;
 
 namespace Seng2250A3.Services;
 
 public interface IMailjetService
 {
     Task SendVerificationEmailAsync(string recipientEmail, string verificationCode);
+    Task SendUserDetailsEmailAsync(string recipientEmail, string username, string password);
 }
 
 public class MailjetService : IMailjetService
@@ -19,31 +19,33 @@ public class MailjetService : IMailjetService
         var apiKey = configuration["Mailjet:ApiKey"];
         var apiSecret = configuration["Mailjet:ApiSecret"];
         _client = new MailjetClient(apiKey, apiSecret);
-        Console.WriteLine("MailjetService instantiated");
     }
 
     public async Task SendVerificationEmailAsync(string recipientEmail, string verificationCode)
     {
-        var request = new MailjetRequest
-        {
-            Resource = Send.Resource
-        }
-        .Property(Send.Messages, new JArray {
-            new JObject {
-                { "From", new JObject {
-                    { "Email", "c3259091@uon.edu.au" },
-                    { "Name", "Your Name" }
-                }},
-                { "To", new JArray {
-                    new JObject {
-                        { "Email", recipientEmail }
-                    }
-                }},
-                { "Subject", "Your Verification Code" },
-                { "TextPart", $"Your verification code is: {verificationCode}" }
-            }
-        });
+       
+        var email = new TransactionalEmailBuilder()
+                .WithFrom(new SendContact("batesysgaming@gmail.com"))
+                .WithSubject("Verification Code")
+                .WithHtmlPart($"<h1>{verificationCode}</h1>")
+                .WithTo(new SendContact("batesysgaming@gmail.com"))
+                .Build();
+        
+        await _client.SendTransactionalEmailAsync(email);
+    }
+    
+    public async Task SendUserDetailsEmailAsync(string recipientEmail, string username, string password)
+    {
+        var email = new TransactionalEmailBuilder()
+            .WithFrom(new SendContact("batesysgaming@gmail.com"))
+            .WithSubject("Your Account Details")
+            .WithHtmlPart($@"
+                <h1>Welcome, {username}!</h1>
+                <p><strong>Username:</strong> {username}</p>
+                <p><strong>Password:</strong> {password}</p>")
+            .WithTo(new SendContact("batesysgaming@gmail.com"))
+            .Build();
 
-        await _client.PostAsync(request);
+        var response = await _client.SendTransactionalEmailAsync(email);
     }
 }

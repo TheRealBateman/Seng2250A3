@@ -1,79 +1,125 @@
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.Cryptography.KeyDerivation;
 using Microsoft.AspNetCore.Mvc;
+using Seng2250A3.Enums;
+using Seng2250A3.Models;
+using Seng2250A3.Requests;
 using Seng2250A3.Services;
+using Seng2250A3.Utils;
 
 namespace Seng2250A3.Controllers;
 
-
 [ApiController]
 [Route("[controller]")]
-public class UserController : Controller 
+public class UserController : Controller
 {
-    private static Dictionary<string, User> _users = new()
-    {
-        {
-            "root",
-            new User
-            {
-                Username = "root", Email = "root@example.com", Password = GenerateRandomPassword(), IsAdmin = true
-            }
-        }
-    };
-
+    private readonly IUserService _userService;
     private readonly IMailjetService _mailjetService;
     private static readonly Dictionary<string, string> VerificationCodes = new();
-    private static readonly Dictionary<string, (string Token, DateTime Expiry)> Tokens = new();
-    private readonly ILogger<UserController> _logger;
-    public UserController(IMailjetService mailjetService, ILogger<UserController> logger)
+
+    public UserController(IUserService userService, IMailjetService mailjetService)
     {
+        _userService = userService;
         _mailjetService = mailjetService;
-        _logger = logger;
-        _logger.LogInformation("UserController instantiated");
-        InitializeDefaultUser();
     }
-    private void InitializeDefaultUser()
+
+    // Admin Console Endpoint
+    [HttpPost("AdminConsole")]
+    public async Task<IActionResult> AdminConsole([FromBody] AdminConsoleRequest request)
     {
-        string randomPassword = GenerateRandomPassword();
-        byte[] salt = RandomNumberGenerator.GetBytes(128 / 8);
-        string hashedPassword = Convert.ToBase64String(KeyDerivation.Pbkdf2(
-            password: randomPassword,
-            salt: salt,
-            prf: KeyDerivationPrf.HMACSHA256,
-            iterationCount: 100000,
-            numBytesRequested: 256 / 8));
-
-        string storedPassword = $"{Convert.ToBase64String(salt)}:{hashedPassword}";
-
-        _users["root"] = new User
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        Console.WriteLine();
+        if (!AuthUtils.IsTokenValid(token))
         {
-            Username = "root",
-            Email = "root@example.com",
-            Password = storedPassword,
-            IsAdmin = true
+            return Unauthorized("Invalid or expired token.");
+        }
+
+        if (request.Command != CommandType.AddUser)
+        {
+            var user = _userService.GetUser(request.Username);
+            if (user == null)
+            {
+                return NotFound($"{request.Username} not found");
+            }
+            return request.Command switch
+            {
+                CommandType.AddUser => await HandleAddUser(request),
+                CommandType.ModifyUser => HandleModifyUser(request, user),
+                CommandType.DeleteUser => HandleDeleteUser(request.Username),
+                _ => BadRequest("Invalid command type.")
+            };
+        }
+
+        return request.Command switch
+        {
+            CommandType.AddUser => await HandleAddUser(request),
+            _ => BadRequest("Invalid command type.")
+        };
+    }
+
+    private async Task<IActionResult> HandleAddUser(AdminConsoleRequest request)
+    {
+        string randomPassword = AuthUtils.GenerateRandomPassword();
+        string hashedPasswordWithSalt = AuthUtils.HashPassword(randomPassword, out _);
+
+        var newUser = new User
+        {
+            Username = request.Username,
+            Email = request.Email,
+            Password = hashedPasswordWithSalt,
+            SecurityLevel = request.SecurityLevel,
+            IsAdmin = request.IsAdmin ?? false
         };
 
-        Console.WriteLine($"Default user created: Username = root, Password = {randomPassword}");
+        _userService.AddUser(newUser);
+        await _mailjetService.SendUserDetailsEmailAsync("batesysgaming@gmail.com", newUser.Username, randomPassword);
+
+        return Ok($"User {request.Username} has been created.");
     }
 
-    // Endpoint to request a verification code
-    [HttpPost("RequestVerificationCode")]
-    public async Task<IActionResult> RequestVerificationCode([FromBody] VerificationRequest request)
+    private IActionResult HandleModifyUser(AdminConsoleRequest request, User user)
     {
-        if (!_users.TryGetValue(request.Username, out var user) || !VerifyPassword(request.Password, user.Password))
+        user.SecurityLevel = request.SecurityLevel;
+
+        var result = _userService.ModifyUser(user.Username, user);
+        if (!result)
+        {
+            return BadRequest($"Failed to update user {request.Username}.");
+        }
+
+        return Ok($"User {request.Username} modified. New SecurityLevel: {request.SecurityLevel}");
+    }
+
+    private IActionResult HandleDeleteUser(string username)
+    {
+        var result = _userService.DeleteUser(username);
+        if (!result)
+        {
+            return NotFound($"User {username} not found.");
+        }
+
+        return Ok($"User {username} deleted.");
+    }
+
+    // User Login Endpoint
+    [HttpPost("Login")]
+    public async Task<IActionResult> Login([FromBody] VerificationRequest request)
+    {
+        var user = _userService.GetUser(request.Username);
+        if (user == null || !AuthUtils.VerifyPassword(request.Password, user.Password))
         {
             return Unauthorized("Invalid username or password.");
         }
 
-        string verificationCode = "123456"; // Replace with random code if desired
+        string verificationCode = "123456"; // Replace with random code generation if desired
         VerificationCodes[request.Username] = verificationCode;
 
         await _mailjetService.SendVerificationEmailAsync(user.Email, verificationCode);
-
         return Ok("Verification code sent to your email.");
     }
 
-    // Endpoint to verify the code and issue a token
+    // Verify Code Endpoint
     [HttpPost("VerifyCode")]
     public IActionResult VerifyCode([FromBody] CodeVerificationRequest request)
     {
@@ -82,122 +128,34 @@ public class UserController : Controller
             return Unauthorized("Invalid verification code.");
         }
 
-        string token = GenerateToken();
-        DateTime expiry = DateTime.UtcNow.AddMinutes(15);
-        Tokens[request.Username] = (token, expiry);
-        VerificationCodes.Remove(request.Username);
+        var user = _userService.GetUser(request.Username);
+        if (user == null)
+        {
+            return NotFound("User not found.");
+        }
 
+        string token = AuthUtils.GenerateToken(user.SecurityLevel);
+        VerificationCodes.Remove(request.Username);
         return Ok(new { Token = token });
     }
 
-    // Add a new user
-    [HttpPost("AddUser")]
-    public async Task<IActionResult> AddUser([FromBody] UserCreateRequest userCreateRequest, [FromHeader] string token)
-    {
-        if (!IsTokenValid(token))
-        {
-            return Unauthorized("Invalid or expired token.");
-        }
-
-        if (_users.ContainsKey(userCreateRequest.Username))
-            return BadRequest("User already exists.");
-
-        string randomPassword = GenerateRandomPassword();
-        byte[] salt = RandomNumberGenerator.GetBytes(128 / 8);
-        string hashedPassword = Convert.ToBase64String(KeyDerivation.Pbkdf2(
-            password: randomPassword,
-            salt: salt,
-            prf: KeyDerivationPrf.HMACSHA256,
-            iterationCount: 100000,
-            numBytesRequested: 256 / 8));
-
-        string storedPassword = $"{Convert.ToBase64String(salt)}:{hashedPassword}";
-
-        _users[userCreateRequest.Username] = new User
-        {
-            Username = userCreateRequest.Username,
-            Email = userCreateRequest.Email,
-            Password = storedPassword,
-            IsAdmin = false
-        };
-
-        await _mailjetService.SendVerificationEmailAsync(userCreateRequest.Email, randomPassword);
-
-        return Ok($"User added. Random password: {randomPassword}");
-    }
-
-    // Modify a user
-    [HttpPost("ModifyUser")]
-    public IActionResult ModifyUser([FromBody] UserModifyRequest userModifyRequest, [FromHeader] string token)
-    {
-        if (!IsTokenValid(token))
-        {
-            return Unauthorized("Invalid or expired token.");
-        }
-
-        if (!_users.TryGetValue(userModifyRequest.Username, out var user))
-            return NotFound("User not found");
-
-        user.IsAdmin = userModifyRequest.IsAdmin;
-        return Ok("User modified");
-    }
-
-    // Delete a user
-    [HttpPost("DeleteUser")]
-    public IActionResult DeleteUser([FromBody] UserDeleteRequest userDeleteRequest, [FromHeader] string token)
-    {
-        if (!IsTokenValid(token))
-        {
-            return Unauthorized("Invalid or expired token.");
-        }
-
-        if (!_users.Remove(userDeleteRequest.Username))
-            return NotFound("User not found");
-
-        return Ok("User deleted");
-    }
-
-    // Test endpoint without token verification
-    [HttpGet("Test")]
-    public IActionResult Test()
-    {
-        return Content("huh");
-    }
-
-    // Admin console (example, without token verification for now)
-    [HttpPost("AdminConsole")]
-    public IActionResult AdminConsole()
-    {
-        return Content("Access denied");
-    }
-
-    // Audit expenses
-    [HttpPost("AuditExpenses")]
-    public IActionResult AuditExpenses([FromHeader] string token)
-    {
-        if (!IsTokenValid(token))
-        {
-            return Unauthorized("Invalid or expired token.");
-        }
-
-        try
-        {
-            var expenses = System.IO.File.ReadAllText("expenses.txt");
-            return Ok(new Dictionary<string, object> { { "e", expenses } });
-        }
-        catch (FileNotFoundException)
-        {
-            return Ok(new Dictionary<string, object> { { "e", "none" } });
-        }
-    }
-
-    // Add an expense
+    // Add Expense Endpoint
     [HttpPost("AddExpense")]
-    public IActionResult AddExpense([FromBody] Dictionary<string, string> newExpense, [FromHeader] string token)
+    public IActionResult AddExpense([FromBody] Dictionary<string, string> newExpense)
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        if (securityLevel != SecurityLevel.TopSecret)
+        {
+            return Unauthorized("You do not have permission to add expenses.");
         }
 
         try
@@ -211,13 +169,53 @@ public class UserController : Controller
         }
     }
 
-    // Audit timesheets
-    [HttpPost("AuditTimesheets")]
-    public IActionResult AuditTimesheets([FromHeader] string token)
+    // Audit expenses
+    [HttpPost("AuditExpenses")]
+    public IActionResult AuditExpenses()
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        // Apply Biba model rules for access control
+        if (!(securityLevel == SecurityLevel.TopSecret || securityLevel == SecurityLevel.Secret || securityLevel == SecurityLevel.Unclassified))
+        {
+            return Unauthorized("You do not have permission to audit expenses.");
+        }
+
+        try
+        {
+            var expenses = System.IO.File.ReadAllText("expenses.txt");
+            return Ok(new Dictionary<string, object> { { "e", expenses } });
+        }
+        catch (FileNotFoundException)
+        {
+            return Ok(new Dictionary<string, object> { { "e", "none" } });
+        }
+    }
+
+    // Audit timesheets
+    [HttpPost("AuditTimesheets")]
+    public IActionResult AuditTimesheets()
+    {
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
+        {
+            return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        // Apply Biba model rules for access control
+        if (!(securityLevel == SecurityLevel.TopSecret || securityLevel == SecurityLevel.Secret || securityLevel == SecurityLevel.Unclassified))
+        {
+            return Unauthorized("You do not have permission to audit timesheets.");
         }
 
         try
@@ -233,11 +231,21 @@ public class UserController : Controller
 
     // Submit a timesheet
     [HttpPost("SubmitTimesheet")]
-    public IActionResult SubmitTimesheet([FromBody] string newTimesheet, [FromHeader] string token)
+    public IActionResult SubmitTimesheet([FromBody] string newTimesheet)
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        // Apply Biba model rules for access control
+        if (securityLevel == SecurityLevel.Secret || securityLevel == SecurityLevel.Unclassified)
+        {
+            return Unauthorized("You do not have permission to submit timesheets.");
         }
 
         try
@@ -253,11 +261,21 @@ public class UserController : Controller
 
     // View meeting minutes
     [HttpPost("ViewMeetingMinutes")]
-    public IActionResult ViewMeetingMinutes([FromHeader] string token)
+    public IActionResult ViewMeetingMinutes()
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        // Apply Biba model rules for access control
+        if (securityLevel == SecurityLevel.TopSecret)
+        {
+            return Unauthorized("You do not have permission to view meeting minutes.");
         }
 
         try
@@ -273,11 +291,20 @@ public class UserController : Controller
 
     // Add meeting minutes
     [HttpPost("AddMeetingMinutes")]
-    public IActionResult AddMeetingMinutes([FromBody] string newMeetingMinutes, [FromHeader] string token)
+    public IActionResult AddMeetingMinutes([FromBody] string newMeetingMinutes)
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        // Apply Biba model rules for access control
+        if (securityLevel != SecurityLevel.TopSecret && securityLevel != SecurityLevel.Secret)
+        {
+            return Unauthorized("You do not have permission to add meeting minutes.");
         }
 
         try
@@ -293,11 +320,21 @@ public class UserController : Controller
 
     // View roster
     [HttpPost("ViewRoster")]
-    public IActionResult ViewRoster([FromHeader] string token)
+    public IActionResult ViewRoster()
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+
+        // Apply Biba model rules for access control
+        if (securityLevel == SecurityLevel.Secret || securityLevel == SecurityLevel.TopSecret)
+        {
+            return Unauthorized("You do not have permission to view the roster.");
         }
 
         try
@@ -313,11 +350,20 @@ public class UserController : Controller
 
     // Add to roster
     [HttpPost("AddToRoster")]
-    public IActionResult AddToRoster([FromBody] string newRosterEntry, [FromHeader] string token)
+    public IActionResult AddToRoster([FromBody] string newRosterEntry)
     {
-        if (!IsTokenValid(token))
+        var authorizationHeader = HttpContext.Request.Headers["Authorization"];
+        var token = authorizationHeader.ToString().Replace("Bearer ", "").Trim();
+        if (!AuthUtils.IsTokenValid(token))
         {
             return Unauthorized("Invalid or expired token.");
+        }
+
+        var securityLevel = AuthUtils.Tokens[token].SecurityLevel;
+        
+        if (!(securityLevel == SecurityLevel.TopSecret || securityLevel == SecurityLevel.Secret || securityLevel == SecurityLevel.Unclassified))
+        {
+            return Unauthorized("You do not have permission to add to the roster.");
         }
 
         try
@@ -329,29 +375,5 @@ public class UserController : Controller
         {
             return Content("Unable to add to roster");
         }
-    }
-
-    private bool IsTokenValid(string token)
-    {
-        // Implement your token validation logic here
-        return Tokens.Any(t => t.Value.Token == token && t.Value.Expiry > DateTime.UtcNow);
-    }
-
-    private static string GenerateToken()
-    {
-        // Implement your token generation logic here
-        return Guid.NewGuid().ToString();
-    }
-
-    private static string GenerateRandomPassword()
-    {
-        // Implement your random password generation logic here
-        return "randomPassword"; // Replace with actual logic
-    }
-
-    private static bool VerifyPassword(string inputPassword, string storedPassword)
-    {
-        // Implement your password verification logic here
-        return true; // Replace with actual logic
     }
 }

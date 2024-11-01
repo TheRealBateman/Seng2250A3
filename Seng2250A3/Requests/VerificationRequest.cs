@@ -1,4 +1,4 @@
-namespace Seng2250A3;
+namespace Seng2250A3.Requests;
 
 public class VerificationRequest
 {
